@@ -1,0 +1,395 @@
+# Scenario 2: EKF vs UKF in a highly nonlinear scenario
+# In this scenario, we simulate a target moving in a curved path with nonlinear
+# range and bearing measurements from a fixed sensor.
+
+# Imports
+import sys
+
+sys.path.insert(0, "src")
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+# plotting settings
+plt.rcParams["figure.figsize"] = (10, 6)
+plt.rcParams["font.size"] = 14
+
+# Scenario 3 Data Generation
+np.random.seed(123)
+
+dt3 = 0.05
+T3 = 200
+t3 = np.arange(0, T3 * dt3, dt3)
+
+beta = 0.002  # drag coefficient
+g3 = 9.81  # gravity
+
+# Sensor location
+sensor_pos3 = np.array([0.0, 0.0])
+
+
+def wrap_angle(angle):
+    """Wrap angle to [-pi, pi]."""
+    return (angle + np.pi) % (2 * np.pi) - np.pi
+
+
+def angle_diff(a, b):
+    """Wrapped angle difference a - b."""
+    return wrap_angle(a - b)
+
+
+# Nonlinear dynamics function (Euler discretization)
+def f_reentry(x, u=None):
+    """Nonlinear dynamics: drag + gravity."""
+    px, py, vx, vy = x
+    speed = np.sqrt(vx**2 + vy**2)
+    ax = -beta * vx * speed
+    ay = -beta * vy * speed - g3
+    return np.array(
+        [
+            px + vx * dt3,
+            py + vy * dt3,
+            vx + ax * dt3,
+            vy + ay * dt3,
+        ]
+    )
+
+
+# Nonlinear measurement: range + bearing from sensor
+def h_reentry(x):
+    """Measurement: [range, bearing] from sensor at origin."""
+    dx = x[0] - sensor_pos3[0]
+    dy = x[1] - sensor_pos3[1]
+    r = np.sqrt(dx**2 + dy**2)
+    theta = np.arctan2(dy, dx)
+    return np.array([r, theta])
+
+
+# Process noise
+Q3_true = np.diag([0.01, 0.01, 0.5, 0.5])
+
+# Generate true trajectory
+true_state3 = np.zeros((4, T3))
+true_state3[:, 0] = [100.0, 500.0, 50.0, 30.0]  # high, fast, going right and up
+
+for k in range(1, T3):
+    true_state3[:, k] = f_reentry(true_state3[:, k - 1])
+    true_state3[:, k] += np.random.multivariate_normal(np.zeros(4), Q3_true * dt3)
+
+# Measurement noise
+R3 = np.diag([5.0, 0.01])  # range noise (m^2), bearing noise (rad^2)
+
+# Generate measurements
+measurements3 = np.zeros((2, T3))
+for k in range(T3):
+    measurements3[:, k] = h_reentry(true_state3[:, k]) + np.random.multivariate_normal(
+        np.zeros(2), R3
+    )
+    measurements3[1, k] = wrap_angle(measurements3[1, k])
+
+
+# Plotting
+fig3_data, ax3 = plt.subplots(1, 3, figsize=(18, 5))
+
+ax3[0].plot(true_state3[0, :], true_state3[1, :], "b-", label="True Trajectory")
+ax3[0].plot(sensor_pos3[0], sensor_pos3[1], "r^", markersize=12, label="Sensor")
+ax3[0].plot(true_state3[0, 0], true_state3[1, 0], "go", markersize=10, label="Start")
+ax3[0].set_title("True Trajectory (Drag + Gravity)")
+ax3[0].set_xlabel("X (m)")
+ax3[0].set_ylabel("Y (m)")
+ax3[0].legend()
+ax3[0].grid()
+
+speed_true = np.sqrt(true_state3[2, :] ** 2 + true_state3[3, :] ** 2)
+ax3[1].plot(t3, speed_true, "b-")
+ax3[1].set_title("True Speed Over Time")
+ax3[1].set_xlabel("Time (s)")
+ax3[1].set_ylabel("Speed (m/s)")
+ax3[1].grid()
+
+ax3[2].plot(t3, measurements3[0, :], "r.", alpha=0.5, label="Range")
+ax3_twin = ax3[2].twinx()
+ax3_twin.plot(t3, np.degrees(measurements3[1, :]), "b.", alpha=0.5, label="Bearing")
+ax3[2].set_xlabel("Time (s)")
+ax3[2].set_ylabel("Range (m)", color="r")
+ax3_twin.set_ylabel("Bearing (deg)", color="b")
+ax3[2].set_title("Measurements")
+ax3[2].grid()
+ax3_twin.grid(False)
+
+fig3_data.suptitle(
+    "Scenario 3: Re-entry Vehicle Data Generation", fontsize=16, fontweight="bold"
+)
+fig3_data.tight_layout()
+plt.show()
+
+
+# Jacobians for EKF
+def F_jac_reentry(x, u=None):
+    """Jacobian of f_reentry w.r.t. state."""
+    px, py, vx, vy = x
+    speed = np.sqrt(vx**2 + vy**2)
+    if speed < 1e-8:
+        speed = 1e-8  # avoid division by zero
+
+    F = np.eye(4) + dt3 * np.array(
+        [
+            [0, 0, 1, 0],
+            [0, 0, 0, 1],
+            [0, 0, -beta * (2 * vx**2 + vy**2) / speed, -beta * vx * vy / speed],
+            [0, 0, -beta * vx * vy / speed, -beta * (vx**2 + 2 * vy**2) / speed],
+        ]
+    )
+    return F
+
+
+def H_jac_reentry(x):
+    """Jacobian of h_reentry w.r.t. state."""
+    dx = x[0] - sensor_pos3[0]
+    dy = x[1] - sensor_pos3[1]
+    r2 = dx**2 + dy**2
+    r = np.sqrt(r2)
+    if r < 1e-8:
+        r = 1e-8
+        r2 = r**2
+
+    H = np.array(
+        [
+            [dx / r, dy / r, 0, 0],
+            [-dy / r2, dx / r2, 0, 0],
+        ]
+    )
+    return H
+
+
+# Filter tuning
+Q3_filter = np.diag([0.1, 0.1, 2.0, 2.0])  # inflated process noise
+
+# Initial conditions (slightly off from truth)
+x0_3 = np.array([100, 500, 48, 28], dtype=float)
+P0_3 = np.diag([20, 20, 10, 10]).astype(float)
+
+
+# EKF IMPLEMENTATION INLINE
+x_est_ekf3 = np.zeros((T3, 4))
+P_est_ekf3 = np.zeros((T3, 4, 4))
+innov_ekf3 = np.zeros((T3, 2))
+innov_cov_ekf3 = np.zeros((T3, 2, 2))
+
+x_ekf = x0_3.copy()
+P_ekf = P0_3.copy()
+I4 = np.eye(4)
+
+for k in range(T3):
+    # -----------------
+    # Predict
+    # -----------------
+    Fk = F_jac_reentry(x_ekf)
+    x_pred = f_reentry(x_ekf)
+    P_pred = Fk @ P_ekf @ Fk.T + Q3_filter
+
+    # -----------------
+    # Update
+    # -----------------
+    z_k = measurements3[:, k]
+    z_pred = h_reentry(x_pred)
+    Hk = H_jac_reentry(x_pred)
+
+    y_k = z_k - z_pred
+    y_k[1] = angle_diff(z_k[1], z_pred[1])  # wrap bearing innovation
+
+    Sk = Hk @ P_pred @ Hk.T + R3
+    Kk = P_pred @ Hk.T @ np.linalg.inv(Sk)
+
+    x_ekf = x_pred + Kk @ y_k
+    P_ekf = (I4 - Kk @ Hk) @ P_pred
+
+    x_est_ekf3[k] = x_ekf
+    P_est_ekf3[k] = P_ekf
+    innov_ekf3[k] = y_k
+    innov_cov_ekf3[k] = Sk
+
+
+# UKF HELPERS
+def chol_psd(P):
+    """
+    Cholesky with a small jitter for numerical robustness.
+    """
+    jitter = 1e-9
+    for _ in range(6):
+        try:
+            return np.linalg.cholesky(P + jitter * np.eye(P.shape[0]))
+        except np.linalg.LinAlgError:
+            jitter *= 10
+    raise np.linalg.LinAlgError("Cholesky failed even after jitter.")
+
+
+def generate_sigma_points(x, P, alpha, beta_u, kappa):
+    """
+    Generate sigma points and UKF weights.
+    """
+    n = x.shape[0]
+    lam = alpha**2 * (n + kappa) - n
+    gamma = np.sqrt(n + lam)
+
+    S = chol_psd(P)
+
+    sigma_points = np.zeros((2 * n + 1, n))
+    sigma_points[0] = x
+
+    for i in range(n):
+        sigma_points[i + 1] = x + gamma * S[:, i]
+        sigma_points[n + i + 1] = x - gamma * S[:, i]
+
+    Wm = np.full(2 * n + 1, 1.0 / (2 * (n + lam)))
+    Wc = np.full(2 * n + 1, 1.0 / (2 * (n + lam)))
+
+    Wm[0] = lam / (n + lam)
+    Wc[0] = lam / (n + lam) + (1 - alpha**2 + beta_u)
+
+    return sigma_points, Wm, Wc
+
+
+def weighted_angle_mean(angles, weights):
+    """
+    Compute weighted circular mean of angles.
+    """
+    s = np.sum(weights * np.sin(angles))
+    c = np.sum(weights * np.cos(angles))
+    return np.arctan2(s, c)
+
+
+# UKF parameters
+n_x = 4
+n_z = 2
+alpha = 1.0
+beta_u = 2.0
+kappa = 0.0
+
+x_est_ukf3 = np.zeros((T3, 4))
+P_est_ukf3 = np.zeros((T3, 4, 4))
+innov_ukf3 = np.zeros((T3, 2))
+
+x_ukf = x0_3.copy()
+P_ukf = P0_3.copy()
+
+for k in range(T3):
+    # Predict
+    sigma_pts, Wm, Wc = generate_sigma_points(x_ukf, P_ukf, alpha, beta_u, kappa)
+
+    # Propagate sigma points through nonlinear dynamics
+    sigma_pts_pred = np.array([f_reentry(sp) for sp in sigma_pts])
+
+    # Predicted mean
+    x_pred = np.sum(Wm[:, None] * sigma_pts_pred, axis=0)
+
+    # Predicted covariance
+    P_pred = np.zeros((n_x, n_x))
+    for i in range(2 * n_x + 1):
+        dx = sigma_pts_pred[i] - x_pred
+        P_pred += Wc[i] * np.outer(dx, dx)
+    P_pred += Q3_filter
+
+    # Measurement prediction
+    z_sigma = np.array([h_reentry(sp) for sp in sigma_pts_pred])
+
+    z_pred = np.zeros(n_z)
+    z_pred[0] = np.sum(Wm * z_sigma[:, 0])  # range mean
+    z_pred[1] = weighted_angle_mean(z_sigma[:, 1], Wm)  # bearing mean
+
+    # Innovation covariance and cross covariance
+    S = np.zeros((n_z, n_z))
+    Pxz = np.zeros((n_x, n_z))
+
+    for i in range(2 * n_x + 1):
+        dz = z_sigma[i] - z_pred
+        dz[1] = angle_diff(z_sigma[i, 1], z_pred[1])
+
+        dx = sigma_pts_pred[i] - x_pred
+
+        S += Wc[i] * np.outer(dz, dz)
+        Pxz += Wc[i] * np.outer(dx, dz)
+
+    S += R3
+
+    # Update
+    z_k = measurements3[:, k]
+    y_k = z_k - z_pred
+    y_k[1] = angle_diff(z_k[1], z_pred[1])
+
+    K = Pxz @ np.linalg.inv(S)
+
+    x_ukf = x_pred + K @ y_k
+    P_ukf = P_pred - K @ S @ K.T
+
+    x_est_ukf3[k] = x_ukf
+    P_est_ukf3[k] = P_ukf
+    innov_ukf3[k] = y_k
+
+# Plotting
+fig3_sol, ax3_sol = plt.subplots(2, 2, figsize=(14, 10))
+
+# Trajectory comparison
+ax3_sol[0, 0].plot(
+    true_state3[0, :], true_state3[1, :], "b-", label="True", linewidth=2
+)
+ax3_sol[0, 0].plot(x_est_ekf3[:, 0], x_est_ekf3[:, 1], "r--", label="EKF", linewidth=2)
+ax3_sol[0, 0].plot(x_est_ukf3[:, 0], x_est_ukf3[:, 1], "g--", label="UKF", linewidth=2)
+ax3_sol[0, 0].plot(sensor_pos3[0], sensor_pos3[1], "r^", markersize=12)
+ax3_sol[0, 0].set_title("Trajectory Comparison")
+ax3_sol[0, 0].set_xlabel("X (m)")
+ax3_sol[0, 0].set_ylabel("Y (m)")
+ax3_sol[0, 0].legend()
+ax3_sol[0, 0].grid()
+
+# Position RMSE
+rmse_ekf3 = np.sqrt(
+    (true_state3[0, :] - x_est_ekf3[:, 0]) ** 2
+    + (true_state3[1, :] - x_est_ekf3[:, 1]) ** 2
+)
+rmse_ukf3 = np.sqrt(
+    (true_state3[0, :] - x_est_ukf3[:, 0]) ** 2
+    + (true_state3[1, :] - x_est_ukf3[:, 1]) ** 2
+)
+
+ax3_sol[0, 1].plot(t3, rmse_ekf3, "r-", label="EKF RMSE", linewidth=2)
+ax3_sol[0, 1].plot(t3, rmse_ukf3, "g-", label="UKF RMSE", linewidth=2)
+ax3_sol[0, 1].set_title("Position RMSE")
+ax3_sol[0, 1].set_xlabel("Time (s)")
+ax3_sol[0, 1].set_ylabel("RMSE (m)")
+ax3_sol[0, 1].legend()
+ax3_sol[0, 1].grid()
+
+# Velocity comparison
+ax3_sol[1, 0].plot(t3, true_state3[2, :], "b-", label="True Vx", linewidth=2)
+ax3_sol[1, 0].plot(t3, x_est_ekf3[:, 2], "r--", label="EKF Vx")
+ax3_sol[1, 0].plot(t3, x_est_ukf3[:, 2], "g--", label="UKF Vx")
+ax3_sol[1, 0].plot(t3, true_state3[3, :], "b-", alpha=0.5, linewidth=2)
+ax3_sol[1, 0].plot(t3, x_est_ekf3[:, 3], "r:", label="EKF Vy")
+ax3_sol[1, 0].plot(t3, x_est_ukf3[:, 3], "g:", label="UKF Vy")
+ax3_sol[1, 0].set_title("Velocity Estimates")
+ax3_sol[1, 0].set_xlabel("Time (s)")
+ax3_sol[1, 0].set_ylabel("Velocity (m/s)")
+ax3_sol[1, 0].legend(fontsize=10)
+ax3_sol[1, 0].grid()
+
+# EKF vs UKF covariance trace
+trace_ekf3 = np.array([np.trace(P_est_ekf3[k]) for k in range(T3)])
+trace_ukf3 = np.array([np.trace(P_est_ukf3[k]) for k in range(T3)])
+
+ax3_sol[1, 1].plot(t3, trace_ekf3, "r-", label="EKF tr(P)", linewidth=2)
+ax3_sol[1, 1].plot(t3, trace_ukf3, "g-", label="UKF tr(P)", linewidth=2)
+ax3_sol[1, 1].set_title("Covariance Trace (Total Uncertainty)")
+ax3_sol[1, 1].set_xlabel("Time (s)")
+ax3_sol[1, 1].set_ylabel("tr(P)")
+ax3_sol[1, 1].legend()
+ax3_sol[1, 1].grid()
+
+fig3_sol.suptitle(
+    "Scenario 3: EKF vs UKF (Highly Nonlinear System)", fontsize=16, fontweight="bold"
+)
+fig3_sol.tight_layout()
+plt.show()
+
+print(f"EKF mean position RMSE: {np.mean(rmse_ekf3):.2f} m")
+print(f"UKF mean position RMSE: {np.mean(rmse_ukf3):.2f} m")
