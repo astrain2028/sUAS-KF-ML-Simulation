@@ -1,0 +1,339 @@
+# Scenario 1: Curved Path with Nonlinear Range-Bearing Measurements
+# This scenario tests the EKF's ability to handle nonlinear measurements and a curved trajectory.
+
+# Imports
+import sys
+
+sys.path.insert(0, "src")
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+# plotting settings
+plt.rcParams["figure.figsize"] = (10, 6)
+plt.rcParams["font.size"] = 14
+
+
+# Scenario 2 Data Generation
+np.random.seed(42)
+
+dt2 = 0.1
+T2 = 1000
+t2 = np.arange(0, T2 * dt2, dt2)
+
+# Sensor location
+sensor_pos = np.array([50.0, 50.0])
+
+# True dynamics: constant velocity with small process noise
+F2 = np.array([
+    [1, 0, dt2, 0],
+    [0, 1, 0, dt2],
+    [0, 0, 1,   0],
+    [0, 0, 0,   1],
+])
+
+Q2_true = np.diag([0.01, 0.01, 0.1, 0.1])  # true process noise
+
+# Generate true trajectory (curved path with slight acceleration)
+true_state2 = np.zeros((4, T2))
+true_state2[:, 0] = [0, 0, 8, 5]  # start at origin, moving right and up
+
+for k in range(1, T2):
+    # Add a slight centripetal-like acceleration to make it curve
+    angle_rate = 0.02  # rad per step
+    vx = true_state2[2, k - 1]
+    vy = true_state2[3, k - 1]
+
+    # Rotate velocity slightly each step
+    true_state2[2, k] = vx * np.cos(angle_rate) - vy * np.sin(angle_rate)
+    true_state2[3, k] = vx * np.sin(angle_rate) + vy * np.cos(angle_rate)
+
+    # Propagate position
+    true_state2[0, k] = true_state2[0, k - 1] + true_state2[2, k] * dt2
+    true_state2[1, k] = true_state2[1, k - 1] + true_state2[3, k] * dt2
+
+    # Add small process noise
+    true_state2[:, k] += np.random.multivariate_normal(np.zeros(4), Q2_true * dt2)
+
+
+# Nonlinear measurement function: range and bearing from sensor
+def h_range_bearing(x):
+    """Measurement function: [range, bearing] from sensor."""
+    dx = x[0] - sensor_pos[0]
+    dy = x[1] - sensor_pos[1]
+    r = np.sqrt(dx**2 + dy**2)
+    theta = np.arctan2(dy, dx)
+    return np.array([r, theta])
+
+
+def wrap_angle(angle):
+    """Wrap angle to [-pi, pi]."""
+    return (angle + np.pi) % (2 * np.pi) - np.pi
+
+
+def angle_diff(a, b):
+    """Compute wrapped angle difference a - b."""
+    return wrap_angle(a - b)
+
+
+# Measurement noise
+R2 = np.diag([2.0, 0.02])  # range noise (m^2), bearing noise (rad^2)
+
+# Generate measurements
+measurements2 = np.zeros((2, T2))
+for k in range(T2):
+    measurements2[:, k] = h_range_bearing(true_state2[:, k]) + np.random.multivariate_normal(
+        np.zeros(2), R2
+    )
+    measurements2[1, k] = wrap_angle(measurements2[1, k])
+
+
+# --- Plotting ---
+fig2_data, ax2 = plt.subplots(1, 2, figsize=(14, 5))
+
+# Trajectory
+ax2[0].plot(true_state2[0, :], true_state2[1, :], "b-", label="True Trajectory")
+ax2[0].plot(sensor_pos[0], sensor_pos[1], "r^", markersize=12, label="Sensor")
+ax2[0].set_title("True Trajectory")
+ax2[0].set_xlabel("X (m)")
+ax2[0].set_ylabel("Y (m)")
+ax2[0].legend()
+ax2[0].grid()
+
+# Measurements
+ax2[1].plot(t2, measurements2[0, :], "r.", alpha=0.5, label="Range")
+ax2_twin = ax2[1].twinx()
+ax2_twin.plot(t2, np.degrees(measurements2[1, :]), "b.", alpha=0.5, label="Bearing")
+ax2[1].set_xlabel("Time (s)")
+ax2[1].set_ylabel("Range (m)", color="r")
+ax2_twin.set_ylabel("Bearing (deg)", color="b")
+ax2[1].set_title("Measurements")
+ax2[1].grid()
+
+fig2_data.suptitle(
+    "Scenario 2: Curved Path Data Generation", fontsize=16, fontweight="bold"
+)
+fig2_data.tight_layout()
+plt.show()
+
+
+# --- Jacobian for nonlinear range-bearing measurement ---
+def H_jac_range_bearing(x):
+    """Jacobian of h(x) = [range, bearing] with respect to [x, y, vx, vy]."""
+    dx = x[0] - sensor_pos[0]
+    dy = x[1] - sensor_pos[1]
+    r2 = dx**2 + dy**2
+    r = np.sqrt(r2)
+
+    # Avoid divide-by-zero if target is exactly at sensor
+    if r < 1e-8:
+        r = 1e-8
+        r2 = r**2
+
+    H = np.array([
+        [ dx / r,      dy / r,      0, 0],
+        [-dy / r2,     dx / r2,     0, 0],
+    ])
+    return H
+
+
+def residual_range_bearing(z, z_pred):
+    """Residual with wrapped bearing innovation."""
+    y = z - z_pred
+    y[1] = angle_diff(z[1], z_pred[1])
+    return y
+
+
+# Linear state model for both KF and EKF
+def f_linear2(x):
+    return F2 @ x
+
+
+# Process noise for filters (slightly inflated)
+Q2_filter = np.diag([0.1, 0.1, 1.0, 1.0])
+
+# Initial conditions
+x0_2 = np.array([0, 0, 8, 5], dtype=float)
+P0_2 = np.diag([10, 10, 5, 5]).astype(float)
+
+# EKF IMPLEMENTATION
+x_est_ekf2 = np.zeros((T2, 4))
+P_est_ekf2 = np.zeros((T2, 4, 4))
+innov_ekf2 = np.zeros((T2, 2))
+innov_cov_ekf2 = np.zeros((T2, 2, 2))
+
+x_ekf = x0_2.copy()
+P_ekf = P0_2.copy()
+
+I4 = np.eye(4)
+
+for k in range(T2):
+    # -----------------
+    # Predict
+    # -----------------
+    x_pred = f_linear2(x_ekf)                 # x_{k|k-1} = F x_{k-1|k-1}
+    P_pred = F2 @ P_ekf @ F2.T + Q2_filter    # P_{k|k-1} = F P F^T + Q
+
+    # -----------------
+    # Update
+    # -----------------
+    z_k = measurements2[:, k]
+    z_pred = h_range_bearing(x_pred)          # nonlinear predicted measurement
+    H_k = H_jac_range_bearing(x_pred)         # Jacobian evaluated at predicted state
+
+    y_k = residual_range_bearing(z_k, z_pred) # innovation / residual
+    S_k = H_k @ P_pred @ H_k.T + R2           # innovation covariance
+    K_k = P_pred @ H_k.T @ np.linalg.inv(S_k) # Kalman gain
+
+    x_ekf = x_pred + K_k @ y_k
+    P_ekf = (I4 - K_k @ H_k) @ P_pred
+
+    # Store results
+    x_est_ekf2[k] = x_ekf
+    P_est_ekf2[k] = P_ekf
+    innov_ekf2[k] = y_k
+    innov_cov_ekf2[k] = S_k
+
+
+# This is intentionally a bad approximation:
+# We linearize the nonlinear measurement model ONCE at the initial state
+# and then use a standard KF with that fixed measurement matrix.
+
+H_nominal = H_jac_range_bearing(x0_2)
+h_nominal = h_range_bearing(x0_2)
+
+x_est_kf2 = np.zeros((T2, 4))
+P_est_kf2 = np.zeros((T2, 4, 4))
+innov_kf2 = np.zeros((T2, 2))
+innov_cov_kf2 = np.zeros((T2, 2, 2))
+
+x_kf = x0_2.copy()
+P_kf = P0_2.copy()
+
+for k in range(T2):
+    # -----------------
+    # Predict
+    # -----------------
+    x_pred = F2 @ x_kf
+    P_pred = F2 @ P_kf @ F2.T + Q2_filter
+
+    # -----------------
+    # Update
+    # -----------------
+    # Fixed linearization about x0:
+    # h(x) ≈ h(x0) + H_nominal (x - x0)
+    #
+    # Rearranged into linear measurement form:
+    # z_tilde = H_nominal x + v
+    # where z_tilde = z - h(x0) + H_nominal x0
+    z_k = measurements2[:, k]
+    z_tilde = z_k - h_nominal + H_nominal @ x0_2
+
+    y_k = z_tilde - H_nominal @ x_pred
+    y_k[1] = wrap_angle(y_k[1])  # crude angle wrapping for bearing channel
+
+    S_k = H_nominal @ P_pred @ H_nominal.T + R2
+    K_k = P_pred @ H_nominal.T @ np.linalg.inv(S_k)
+
+    x_kf = x_pred + K_k @ y_k
+    P_kf = (I4 - K_k @ H_nominal) @ P_pred
+
+    # Store results
+    x_est_kf2[k] = x_kf
+    P_est_kf2[k] = P_kf
+    innov_kf2[k] = y_k
+    innov_cov_kf2[k] = S_k
+
+
+# --- Plotting: Compare KF vs EKF ---
+fig2_sol, ax2_sol = plt.subplots(2, 2, figsize=(14, 10))
+
+# Trajectory comparison
+ax2_sol[0, 0].plot(
+    true_state2[0, :], true_state2[1, :], "b-", label="True", linewidth=2
+)
+ax2_sol[0, 0].plot(
+    x_est_ekf2[:, 0], x_est_ekf2[:, 1], "g--", label="EKF", linewidth=2
+)
+ax2_sol[0, 0].plot(
+    x_est_kf2[:, 0], x_est_kf2[:, 1], "r:", label="KF (fixed H)", linewidth=2
+)
+ax2_sol[0, 0].plot(sensor_pos[0], sensor_pos[1], "r^", markersize=12, label="Sensor")
+ax2_sol[0, 0].set_title("Trajectory Comparison")
+ax2_sol[0, 0].set_xlabel("X (m)")
+ax2_sol[0, 0].set_ylabel("Y (m)")
+ax2_sol[0, 0].legend()
+ax2_sol[0, 0].grid()
+
+# Position RMSE over time
+rmse_ekf2 = np.sqrt(
+    (true_state2[0, :] - x_est_ekf2[:, 0]) ** 2
+    + (true_state2[1, :] - x_est_ekf2[:, 1]) ** 2
+)
+rmse_kf2 = np.sqrt(
+    (true_state2[0, :] - x_est_kf2[:, 0]) ** 2
+    + (true_state2[1, :] - x_est_kf2[:, 1]) ** 2
+)
+
+ax2_sol[0, 1].plot(t2, rmse_ekf2, "g-", label="EKF RMSE", linewidth=2)
+ax2_sol[0, 1].plot(t2, rmse_kf2, "r-", label="KF RMSE", linewidth=2)
+ax2_sol[0, 1].set_title("Position RMSE")
+ax2_sol[0, 1].set_xlabel("Time (s)")
+ax2_sol[0, 1].set_ylabel("RMSE (m)")
+ax2_sol[0, 1].legend()
+ax2_sol[0, 1].grid()
+
+# EKF position error with 2-sigma bounds
+err_x_ekf2 = true_state2[0, :] - x_est_ekf2[:, 0]
+err_y_ekf2 = true_state2[1, :] - x_est_ekf2[:, 1]
+sig_x_ekf2 = np.sqrt(P_est_ekf2[:, 0, 0])
+sig_y_ekf2 = np.sqrt(P_est_ekf2[:, 1, 1])
+
+ax2_sol[1, 0].plot(t2, err_x_ekf2, "b-", label="EKF Error X")
+ax2_sol[1, 0].fill_between(
+    t2, -2 * sig_x_ekf2, 2 * sig_x_ekf2, alpha=0.2, color="b", label="2σ"
+)
+ax2_sol[1, 0].plot(t2, err_y_ekf2, "r-", label="EKF Error Y")
+ax2_sol[1, 0].fill_between(
+    t2, -2 * sig_y_ekf2, 2 * sig_y_ekf2, alpha=0.2, color="r"
+)
+ax2_sol[1, 0].set_title("EKF Position Error with 2σ Bounds")
+ax2_sol[1, 0].set_xlabel("Time (s)")
+ax2_sol[1, 0].set_ylabel("Error (m)")
+ax2_sol[1, 0].legend()
+ax2_sol[1, 0].grid()
+
+# EKF Innovations
+ax2_sol[1, 1].plot(t2, innov_ekf2[:, 0], "b-", alpha=0.7, label="Range Innovation")
+ax2_sol[1, 1].plot(t2, innov_ekf2[:, 1], "r-", alpha=0.7, label="Bearing Innovation")
+
+# Add 2-sigma bounds from innovation covariance
+sig_innov_r = np.sqrt(innov_cov_ekf2[:, 0, 0])
+sig_innov_theta = np.sqrt(innov_cov_ekf2[:, 1, 1])
+
+ax2_sol[1, 1].fill_between(
+    t2, -2 * sig_innov_r, 2 * sig_innov_r, alpha=0.15, color="b", label="2σ Range"
+)
+ax2_sol[1, 1].fill_between(
+    t2,
+    -2 * sig_innov_theta,
+    2 * sig_innov_theta,
+    alpha=0.15,
+    color="r",
+    label="2σ Bearing",
+)
+
+ax2_sol[1, 1].set_title("EKF Innovations with 2σ Bounds")
+ax2_sol[1, 1].set_xlabel("Time (s)")
+ax2_sol[1, 1].set_ylabel("Innovation")
+ax2_sol[1, 1].legend()
+ax2_sol[1, 1].grid()
+
+fig2_sol.suptitle(
+    "Scenario 2: KF vs EKF (Nonlinear Measurements)", fontsize=16, fontweight="bold"
+)
+fig2_sol.tight_layout()
+plt.show()
+
+print(f"EKF final position RMSE: {rmse_ekf2[-1]:.2f} m")
+print(f"KF  final position RMSE: {rmse_kf2[-1]:.2f} m")
