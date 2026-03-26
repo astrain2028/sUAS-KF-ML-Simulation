@@ -1,0 +1,552 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.widgets import Button
+from matplotlib.patches import Rectangle, Polygon, Wedge, Circle
+from matplotlib.transforms import Affine2D
+import torch
+import torch.nn as nn
+
+np.random.seed(42)
+torch.manual_seed(42)
+
+# Parameters
+DT = 0.05
+WHEEL_RADIUS = 0.05
+TRACK_WIDTH = 0.40
+
+ENCODER_NOISE_STD = 0.003
+GYRO_NOISE_STD = 0.01
+
+ENCODER_FAULT_BIAS = 0.10
+GYRO_FAULT_BIAS = 0.25
+
+STATE_DIM = 5
+MEAS_DIM = 5
+FAULT_DIM = 5
+
+TRAIN_RUNS = 40
+TRAIN_STEPS = 180
+LIVE_STEPS_MAX = 400
+
+# Robot model
+# state = [x, y, theta, v, omega]
+# meas  = [enc_fl, enc_fr, enc_rl, enc_rr, gyro_z]
+def wrap_to_pi(angle):
+    return (angle + np.pi) % (2 * np.pi) - np.pi
+
+
+def propagate_state(state):
+    x, y, theta, v, omega = state
+    x = x + v * np.cos(theta) * DT
+    y = y + v * np.sin(theta) * DT
+    theta = wrap_to_pi(theta + omega * DT)
+    return np.array([x, y, theta, v, omega], dtype=float)
+
+
+def command_spath(t):
+    v = 0.85 + 0.12 * np.sin(0.15 * t)
+    omega = 0.90 * np.sin(0.35 * t)
+    return v, omega
+
+
+def wheel_rates_from_body(v, omega):
+    v_r = v + 0.5 * TRACK_WIDTH * omega
+    v_l = v - 0.5 * TRACK_WIDTH * omega
+    phi_dot_r = v_r / WHEEL_RADIUS
+    phi_dot_l = v_l / WHEEL_RADIUS
+    return phi_dot_l, phi_dot_r
+
+
+def measurement_model(state):
+    _, _, _, v, omega = state
+    phi_dot_l, phi_dot_r = wheel_rates_from_body(v, omega)
+
+    dphi_l = phi_dot_l * DT
+    dphi_r = phi_dot_r * DT
+
+    return np.array([dphi_l, dphi_r, dphi_l, dphi_r, omega], dtype=float)
+
+
+def add_noise(z):
+    std = np.array([ENCODER_NOISE_STD] * 4 + [GYRO_NOISE_STD], dtype=float)
+    return z + np.random.randn(5) * std
+
+
+def apply_faults(z, fault_flags):
+    z_faulty = z.copy()
+    for i in range(4):
+        if fault_flags[i]:
+            z_faulty[i] += ENCODER_FAULT_BIAS
+    if fault_flags[4]:
+        z_faulty[4] += GYRO_FAULT_BIAS
+    return z_faulty
+
+
+# Simulation data generation
+def simulate_spath_trial(num_steps):
+    states = np.zeros((num_steps, STATE_DIM))
+    measurements = np.zeros((num_steps, MEAS_DIM))
+
+    state = np.array([0.0, 0.0, 0.0, 0.8, 0.0], dtype=float)
+
+    for k in range(num_steps):
+        t = k * DT
+        v_cmd, omega_cmd = command_spath(t)
+        state[3] = v_cmd
+        state[4] = omega_cmd
+        state = propagate_state(state)
+
+        z = add_noise(measurement_model(state))
+        states[k] = state
+        measurements[k] = z
+
+    return states, measurements
+
+
+def simulate_random_trial(num_steps, fault_prob=0.0):
+    states = np.zeros((num_steps, STATE_DIM))
+    measurements = np.zeros((num_steps, MEAS_DIM))
+    fault_flags_all = np.zeros((num_steps, FAULT_DIM))
+
+    state = np.array([
+        np.random.uniform(-1, 1),
+        np.random.uniform(-1, 1),
+        np.random.uniform(-np.pi, np.pi),
+        0.0,
+        0.0
+    ], dtype=float)
+
+    v_cmd = np.random.uniform(0.2, 1.0)
+    omega_cmd = np.random.uniform(-1.5, 1.5)
+    next_switch = 0.0
+
+    for k in range(num_steps):
+        t = k * DT
+
+        if t >= next_switch:
+            v_cmd = np.random.uniform(0.2, 1.2)
+            omega_cmd = np.random.uniform(-1.8, 1.8)
+            next_switch = t + np.random.uniform(0.8, 2.0)
+
+        state[3] = np.clip(v_cmd + 0.03 * np.random.randn(), 0.0, 1.5)
+        state[4] = np.clip(omega_cmd + 0.06 * np.random.randn(), -2.0, 2.0)
+        state = propagate_state(state)
+
+        z = add_noise(measurement_model(state))
+        fault_flags = (np.random.rand(5) < fault_prob).astype(float)
+        z = apply_faults(z, fault_flags)
+
+        states[k] = state
+        measurements[k] = z
+        fault_flags_all[k] = fault_flags
+
+    return states, measurements, fault_flags_all
+
+
+def build_baseline_dataset(num_runs, num_steps):
+    X_list = []
+    Y_list = []
+
+    for i in range(num_runs):
+        if i < max(1, num_runs // 5):
+            states, measurements = simulate_spath_trial(num_steps)
+        else:
+            states, measurements, _ = simulate_random_trial(num_steps, fault_prob=0.0)
+
+        X_list.append(states)
+        Y_list.append(measurements)
+
+    return np.vstack(X_list), np.vstack(Y_list)
+
+
+def build_fault_dataset(num_runs, num_steps, fault_prob=0.08):
+    X_list = []
+    Y_list = []
+
+    for _ in range(num_runs):
+        states, faulty_measurements, fault_flags_all = simulate_random_trial(
+            num_steps, fault_prob=fault_prob
+        )
+        X_aug = np.hstack([states, fault_flags_all])
+        X_list.append(X_aug)
+        Y_list.append(faulty_measurements)
+
+    return np.vstack(X_list), np.vstack(Y_list)
+
+
+# Neural network
+class Net(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU(),
+            nn.Linear(64, output_dim)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+def standardize_xy(X, Y):
+    x_mean = X.mean(axis=0, keepdims=True)
+    x_std = X.std(axis=0, keepdims=True) + 1e-8
+    y_mean = Y.mean(axis=0, keepdims=True)
+    y_std = Y.std(axis=0, keepdims=True) + 1e-8
+
+    Xn = (X - x_mean) / x_std
+    Yn = (Y - y_mean) / y_std
+
+    stats = {
+        "x_mean": x_mean,
+        "x_std": x_std,
+        "y_mean": y_mean,
+        "y_std": y_std,
+    }
+    return Xn, Yn, stats
+
+
+def train_model(X, Y, input_dim, output_dim, epochs=80):
+    Xn, Yn, stats = standardize_xy(X, Y)
+
+    X_tensor = torch.tensor(Xn, dtype=torch.float32)
+    Y_tensor = torch.tensor(Yn, dtype=torch.float32)
+
+    model = Net(input_dim, output_dim)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    loss_fn = nn.MSELoss()
+
+    loss_history = []
+
+    for _ in range(epochs):
+        optimizer.zero_grad()
+        pred = model(X_tensor)
+        loss = loss_fn(pred, Y_tensor)
+        loss.backward()
+        optimizer.step()
+        loss_history.append(loss.item())
+
+    return model, stats, loss_history
+
+
+def predict_model(model, stats, X):
+    Xn = (X - stats["x_mean"]) / stats["x_std"]
+    X_tensor = torch.tensor(Xn, dtype=torch.float32)
+
+    with torch.no_grad():
+        Yn_pred = model(X_tensor).cpu().numpy()
+
+    Y_pred = Yn_pred * stats["y_std"] + stats["y_mean"]
+    return Y_pred
+
+
+# Widget state
+sim = {
+    "running": False,
+    "mode": "spath",   # "spath" or "mc"
+    "step": 0,
+    "time": 0.0,
+    "state": np.array([0.0, 0.0, 0.0, 0.8, 0.0], dtype=float),
+    "path_x": [0.0],
+    "path_y": [0.0],
+    "baseline_model": None,
+    "baseline_stats": None,
+    "fault_model": None,
+    "fault_stats": None,
+    "trained_baseline": False,
+    "trained_fault": False,
+    "latest_base_res": np.nan,
+    "latest_fault_res": np.nan,
+    "baseline_loss": [],
+    "fault_loss": [],
+    "mc_v_cmd": 0.8,
+    "mc_omega_cmd": 0.0,
+    "mc_next_switch": 0.0,
+}
+
+# Drawing helpers
+def rot2d(theta):
+    c = np.cos(theta)
+    s = np.sin(theta)
+    return np.array([[c, -s], [s, c]])
+
+
+def rect_polygon(cx, cy, length, width, heading):
+    hl = length / 2.0
+    hw = width / 2.0
+    corners = np.array([
+        [ hl,  hw],
+        [ hl, -hw],
+        [-hl, -hw],
+        [-hl,  hw],
+    ])
+    R = rot2d(heading)
+    return (R @ corners.T).T + np.array([cx, cy])
+
+
+# Figure
+plt.close("all")
+fig = plt.figure(figsize=(12, 8))
+ax = fig.add_axes([0.05, 0.08, 0.63, 0.84])
+
+ax.set_aspect("equal", adjustable="box")
+ax.set_xlim(-5, 12)
+ax.set_ylim(-5, 5)
+ax.grid(True, alpha=0.3)
+ax.set_title("Simple 4-Wheel Robot Widget")
+
+path_line, = ax.plot(sim["path_x"], sim["path_y"], lw=2)
+heading_line, = ax.plot([], [], lw=2, color="black")
+
+body_length = 0.55
+body_width = 0.32
+wheel_length = 0.13
+wheel_width = 0.05
+
+# Colorado flag body
+flag_base = Rectangle(
+    (-body_length / 2, -body_width / 2),
+    body_length, body_width,
+    facecolor="white", edgecolor="black", lw=1.5
+)
+stripe_top = Rectangle(
+    (-body_length / 2, body_width / 6),
+    body_length, body_width / 3,
+    facecolor="#003DA5", edgecolor="none"
+)
+stripe_bottom = Rectangle(
+    (-body_length / 2, -body_width / 2),
+    body_length, body_width / 3,
+    facecolor="#003DA5", edgecolor="none"
+)
+c_center = (-0.10, 0.0)
+c_outer = Wedge(c_center, 0.13, 45, 315, width=0.06, facecolor="#C8102E", edgecolor="none")
+sun = Circle(c_center, 0.045, facecolor="#FFD100", edgecolor="none")
+
+for patch in [flag_base, stripe_top, stripe_bottom, c_outer, sun]:
+    ax.add_patch(patch)
+
+wheel_offsets = [
+    ( body_length * 0.28,  body_width / 2 + wheel_width / 2),
+    ( body_length * 0.28, -body_width / 2 - wheel_width / 2),
+    (-body_length * 0.28,  body_width / 2 + wheel_width / 2),
+    (-body_length * 0.28, -body_width / 2 - wheel_width / 2),
+]
+
+wheel_patches = []
+for _ in wheel_offsets:
+    poly = Polygon(
+        rect_polygon(0.0, 0.0, wheel_length, wheel_width, 0.0),
+        closed=True,
+        facecolor="#1a1a1a",
+        edgecolor="black",
+        lw=1.0
+    )
+    ax.add_patch(poly)
+    wheel_patches.append(poly)
+
+status_text = ax.text(
+    0.99, 0.98, "",
+    transform=ax.transAxes,
+    ha="right", va="top",
+    bbox=dict(boxstyle="round", facecolor="white", alpha=0.92),
+    family="monospace", fontsize=9
+)
+
+# Buttons
+ax_run_spath = fig.add_axes([0.72, 0.82, 0.20, 0.055])
+ax_run_mc = fig.add_axes([0.72, 0.74, 0.20, 0.055])
+ax_pause = fig.add_axes([0.72, 0.66, 0.20, 0.055])
+ax_train_base = fig.add_axes([0.72, 0.58, 0.20, 0.055])
+ax_train_fault = fig.add_axes([0.72, 0.50, 0.20, 0.055])
+ax_reset = fig.add_axes([0.72, 0.42, 0.20, 0.055])
+
+btn_run_spath = Button(ax_run_spath, "Run S-Path")
+btn_run_mc = Button(ax_run_mc, "Run MC")
+btn_pause = Button(ax_pause, "Pause")
+btn_train_base = Button(ax_train_base, "Train Baseline")
+btn_train_fault = Button(ax_train_fault, "Train Fault Model")
+btn_reset = Button(ax_reset, "Reset")
+
+# Update display
+def update_robot():
+    x, y, theta, v, omega = sim["state"]
+
+    transform = Affine2D().rotate(theta).translate(x, y) + ax.transData
+    for patch in [flag_base, stripe_top, stripe_bottom, c_outer, sun]:
+        patch.set_transform(transform)
+
+    R = rot2d(theta)
+    for poly, (ox, oy) in zip(wheel_patches, wheel_offsets):
+        wx, wy = (R @ np.array([ox, oy])) + np.array([x, y])
+        poly.set_xy(rect_polygon(wx, wy, wheel_length, wheel_width, theta))
+
+    nose = np.array([x, y]) + 0.45 * np.array([np.cos(theta), np.sin(theta)])
+    heading_line.set_data([x, nose[0]], [y, nose[1]])
+    path_line.set_data(sim["path_x"], sim["path_y"])
+
+    status_text.set_text(
+        f"running:          {sim['running']}\n"
+        f"mode:             {sim['mode']}\n"
+        f"step:             {sim['step']}\n"
+        f"time:             {sim['time']:.2f}\n"
+        f"baseline trained: {sim['trained_baseline']}\n"
+        f"fault trained:    {sim['trained_fault']}\n"
+        f"x:                {x: .3f}\n"
+        f"y:                {y: .3f}\n"
+        f"theta:            {theta: .3f}\n"
+        f"v:                {v: .3f}\n"
+        f"omega:            {omega: .3f}\n"
+        f"base res norm:    {sim['latest_base_res']: .4f}\n"
+        f"fault res norm:   {sim['latest_fault_res']: .4f}"
+    )
+
+    fig.canvas.draw_idle()
+
+# Button callbacks
+def start_spath_mode():
+    sim["mode"] = "spath"
+    sim["running"] = True
+    update_robot()
+
+def start_mc_mode():
+    sim["mode"] = "mc"
+    sim["running"] = True
+    update_robot()
+
+def on_run_spath(event):
+    start_spath_mode()
+
+def on_run_mc(event):
+    start_mc_mode()
+
+def on_pause(event):
+    sim["running"] = False
+    update_robot()
+
+def on_train_baseline(event):
+    print("Building baseline dataset...")
+    X_base, Y_base = build_baseline_dataset(TRAIN_RUNS, TRAIN_STEPS)
+
+    print("Training baseline model: state -> healthy measurements")
+    model, stats, loss_history = train_model(
+        X_base, Y_base,
+        input_dim=5,
+        output_dim=5,
+        epochs=80
+    )
+
+    sim["baseline_model"] = model
+    sim["baseline_stats"] = stats
+    sim["baseline_loss"] = loss_history
+    sim["trained_baseline"] = True
+    print("Baseline training complete.")
+    update_robot()
+
+def on_train_fault(event):
+    print("Building fault dataset...")
+    X_fault, Y_fault = build_fault_dataset(TRAIN_RUNS, TRAIN_STEPS, fault_prob=0.08)
+
+    print("Training fault-aware model: [state + real faults] -> faulty measurements")
+    model, stats, loss_history = train_model(
+        X_fault, Y_fault,
+        input_dim=10,
+        output_dim=5,
+        epochs=80
+    )
+
+    sim["fault_model"] = model
+    sim["fault_stats"] = stats
+    sim["fault_loss"] = loss_history
+    sim["trained_fault"] = True
+    print("Fault model training complete.")
+    update_robot()
+
+def on_reset(event):
+    sim["running"] = False
+    sim["step"] = 0
+    sim["time"] = 0.0
+    sim["mode"] = "spath"
+    sim["state"] = np.array([0.0, 0.0, 0.0, 0.8, 0.0], dtype=float)
+    sim["path_x"] = [0.0]
+    sim["path_y"] = [0.0]
+    sim["latest_base_res"] = np.nan
+    sim["latest_fault_res"] = np.nan
+    sim["mc_v_cmd"] = 0.8
+    sim["mc_omega_cmd"] = 0.0
+    sim["mc_next_switch"] = 0.0
+    update_robot()
+
+btn_run_spath.on_clicked(on_run_spath)
+btn_run_mc.on_clicked(on_run_mc)
+btn_pause.on_clicked(on_pause)
+btn_train_base.on_clicked(on_train_baseline)
+btn_train_fault.on_clicked(on_train_fault)
+btn_reset.on_clicked(on_reset)
+
+# Animation loop
+def step():
+    if not sim["running"]:
+        return
+
+    if sim["step"] >= LIVE_STEPS_MAX:
+        sim["running"] = False
+        update_robot()
+        return
+
+    t = sim["time"]
+
+    if sim["mode"] == "spath":
+        v_cmd, omega_cmd = command_spath(t)
+
+    else:  # MC mode
+        if t >= sim["mc_next_switch"]:
+            sim["mc_v_cmd"] = np.random.uniform(0.2, 1.2)
+            sim["mc_omega_cmd"] = np.random.uniform(-1.8, 1.8)
+            sim["mc_next_switch"] = t + np.random.uniform(0.8, 2.0)
+
+        v_cmd = np.clip(sim["mc_v_cmd"] + 0.03 * np.random.randn(), 0.0, 1.5)
+        omega_cmd = np.clip(sim["mc_omega_cmd"] + 0.06 * np.random.randn(), -2.0, 2.0)
+
+    sim["state"][3] = v_cmd
+    sim["state"][4] = omega_cmd
+    sim["state"] = propagate_state(sim["state"])
+
+    z_clean = measurement_model(sim["state"])
+    z_noisy = add_noise(z_clean)
+
+    fault_vector = (np.random.rand(5) < 0.08).astype(float)
+    z_measured = apply_faults(z_noisy, fault_vector)
+
+    if sim["trained_baseline"]:
+        z_pred_base = predict_model(
+            sim["baseline_model"],
+            sim["baseline_stats"],
+            sim["state"][None, :]
+        )[0]
+        sim["latest_base_res"] = np.linalg.norm(z_measured - z_pred_base)
+
+    if sim["trained_fault"]:
+        X_aug = np.hstack([sim["state"], fault_vector])[None, :]
+        z_pred_fault = predict_model(
+            sim["fault_model"],
+            sim["fault_stats"],
+            X_aug
+        )[0]
+        sim["latest_fault_res"] = np.linalg.norm(z_measured - z_pred_fault)
+
+    sim["path_x"].append(sim["state"][0])
+    sim["path_y"].append(sim["state"][1])
+    sim["time"] += DT
+    sim["step"] += 1
+
+    update_robot()
+
+timer = fig.canvas.new_timer(interval=int(DT * 1000))
+timer.add_callback(step)
+timer.start()
+
+update_robot()
+plt.show()
