@@ -378,6 +378,248 @@ trace_ekf3 = np.array([np.trace(P_est_ekf3[k]) for k in range(T3)])
 trace_ukf3 = np.array([np.trace(P_est_ukf3[k]) for k in range(T3)])
 
 ax3_sol[1, 1].plot(t3, trace_ekf3, "r-", label="EKF tr(P)", linewidth=2)
+
+# Extract individual covariance traces for each state dimension
+cov_ekf3_xx = np.array([P_est_ekf3[k, 0, 0] for k in range(T3)])  # position x variance
+cov_ekf3_yy = np.array([P_est_ekf3[k, 1, 1] for k in range(T3)])  # position y variance
+cov_ekf3_vxvx = np.array(
+    [P_est_ekf3[k, 2, 2] for k in range(T3)]
+)  # velocity x variance
+cov_ekf3_vyvy = np.array(
+    [P_est_ekf3[k, 3, 3] for k in range(T3)]
+)  # velocity y variance
+
+cov_ukf3_xx = np.array([P_est_ukf3[k, 0, 0] for k in range(T3)])
+cov_ukf3_yy = np.array([P_est_ukf3[k, 1, 1] for k in range(T3)])
+cov_ukf3_vxvx = np.array([P_est_ukf3[k, 2, 2] for k in range(T3)])
+cov_ukf3_vyvy = np.array([P_est_ukf3[k, 3, 3] for k in range(T3)])
+
+# Compute position and velocity uncertainty (standard deviations)
+std_ekf3_x = np.sqrt(cov_ekf3_xx)
+std_ekf3_y = np.sqrt(cov_ekf3_yy)
+std_ekf3_vx = np.sqrt(cov_ekf3_vxvx)
+std_ekf3_vy = np.sqrt(cov_ekf3_vyvy)
+
+std_ukf3_x = np.sqrt(cov_ukf3_xx)
+std_ukf3_y = np.sqrt(cov_ukf3_yy)
+std_ukf3_vx = np.sqrt(cov_ukf3_vxvx)
+std_ukf3_vy = np.sqrt(cov_ukf3_vyvy)
+
+# === Figure 1: Position Uncertainty Comparison ===
+fig_cov1, ax_cov1 = plt.subplots(2, 2, figsize=(15, 10))
+
+# X position uncertainty
+ax_cov1[0, 0].plot(t3, std_ekf3_x, "r-", linewidth=2.5, label="EKF σ_x")
+ax_cov1[0, 0].plot(t3, std_ukf3_x, "g-", linewidth=2.5, label="UKF σ_x")
+ax_cov1[0, 0].fill_between(t3, std_ekf3_x, std_ukf3_x, alpha=0.2, color="blue")
+ax_cov1[0, 0].set_title("Position X Uncertainty (σ)", fontsize=12, fontweight="bold")
+ax_cov1[0, 0].set_ylabel("σ_x (m)")
+ax_cov1[0, 0].legend(fontsize=11)
+ax_cov1[0, 0].grid(True, alpha=0.3)
+
+# Y position uncertainty
+ax_cov1[0, 1].plot(t3, std_ekf3_y, "r-", linewidth=2.5, label="EKF σ_y")
+ax_cov1[0, 1].plot(t3, std_ukf3_y, "g-", linewidth=2.5, label="UKF σ_y")
+ax_cov1[0, 1].fill_between(t3, std_ekf3_y, std_ukf3_y, alpha=0.2, color="blue")
+ax_cov1[0, 1].set_title("Position Y Uncertainty (σ)", fontsize=12, fontweight="bold")
+ax_cov1[0, 1].set_ylabel("σ_y (m)")
+ax_cov1[0, 1].legend(fontsize=11)
+ax_cov1[0, 1].grid(True, alpha=0.3)
+
+# Position uncertainty comparison (combined)
+pos_unc_ekf3 = np.sqrt(std_ekf3_x**2 + std_ekf3_y**2)
+pos_unc_ukf3 = np.sqrt(std_ukf3_x**2 + std_ukf3_y**2)
+ax_cov1[1, 0].plot(t3, pos_unc_ekf3, "r-", linewidth=2.5, label="EKF (combined)")
+ax_cov1[1, 0].plot(t3, pos_unc_ukf3, "g-", linewidth=2.5, label="UKF (combined)")
+ax_cov1[1, 0].fill_between(t3, pos_unc_ekf3, pos_unc_ukf3, alpha=0.2, color="blue")
+improvement_pos = (1 - pos_unc_ukf3 / pos_unc_ekf3) * 100
+ax_cov1[1, 0].set_title(
+    f"Combined Position Uncertainty\n(UKF avg improvement: {np.mean(improvement_pos[50:]):.1f}%)",
+    fontsize=12,
+    fontweight="bold",
+)
+ax_cov1[1, 0].set_ylabel("σ_pos (m)")
+ax_cov1[1, 0].set_xlabel("Time (s)")
+ax_cov1[1, 0].legend(fontsize=11)
+ax_cov1[1, 0].grid(True, alpha=0.3)
+
+# Relative improvement (%)
+rel_improvement = (pos_unc_ekf3 - pos_unc_ukf3) / pos_unc_ekf3 * 100
+ax_cov1[1, 1].plot(t3, rel_improvement, "purple", linewidth=2.5)
+ax_cov1[1, 1].axhline(y=0, color="k", linestyle="--", alpha=0.5)
+ax_cov1[1, 1].fill_between(t3, 0, rel_improvement, alpha=0.3, color="purple")
+ax_cov1[1, 1].set_title(
+    "UKF Relative Improvement over EKF", fontsize=12, fontweight="bold"
+)
+ax_cov1[1, 1].set_ylabel("Improvement (%)")
+ax_cov1[1, 1].set_xlabel("Time (s)")
+ax_cov1[1, 1].grid(True, alpha=0.3)
+
+fig_cov1.suptitle(
+    "Scenario 3: Position Uncertainty Comparison (EKF vs UKF)",
+    fontsize=14,
+    fontweight="bold",
+)
+fig_cov1.tight_layout()
+plt.show()
+
+# === Figure 2: Velocity Uncertainty Comparison ===
+fig_cov2, ax_cov2 = plt.subplots(2, 2, figsize=(15, 10))
+
+# Vx velocity uncertainty
+ax_cov2[0, 0].plot(t3, std_ekf3_vx, "r-", linewidth=2.5, label="EKF σ_vx")
+ax_cov2[0, 0].plot(t3, std_ukf3_vx, "g-", linewidth=2.5, label="UKF σ_vx")
+ax_cov2[0, 0].fill_between(t3, std_ekf3_vx, std_ukf3_vx, alpha=0.2, color="blue")
+ax_cov2[0, 0].set_title("Velocity X Uncertainty (σ)", fontsize=12, fontweight="bold")
+ax_cov2[0, 0].set_ylabel("σ_vx (m/s)")
+ax_cov2[0, 0].legend(fontsize=11)
+ax_cov2[0, 0].grid(True, alpha=0.3)
+
+# Vy velocity uncertainty
+ax_cov2[0, 1].plot(t3, std_ekf3_vy, "r-", linewidth=2.5, label="EKF σ_vy")
+ax_cov2[0, 1].plot(t3, std_ukf3_vy, "g-", linewidth=2.5, label="UKF σ_vy")
+ax_cov2[0, 1].fill_between(t3, std_ekf3_vy, std_ukf3_vy, alpha=0.2, color="blue")
+ax_cov2[0, 1].set_title("Velocity Y Uncertainty (σ)", fontsize=12, fontweight="bold")
+ax_cov2[0, 1].set_ylabel("σ_vy (m/s)")
+ax_cov2[0, 1].legend(fontsize=11)
+ax_cov2[0, 1].grid(True, alpha=0.3)
+
+# Velocity uncertainty comparison (combined)
+vel_unc_ekf3 = np.sqrt(std_ekf3_vx**2 + std_ekf3_vy**2)
+vel_unc_ukf3 = np.sqrt(std_ukf3_vx**2 + std_ukf3_vy**2)
+ax_cov2[1, 0].plot(t3, vel_unc_ekf3, "r-", linewidth=2.5, label="EKF (combined)")
+ax_cov2[1, 0].plot(t3, vel_unc_ukf3, "g-", linewidth=2.5, label="UKF (combined)")
+ax_cov2[1, 0].fill_between(t3, vel_unc_ekf3, vel_unc_ukf3, alpha=0.2, color="blue")
+improvement_vel = (1 - vel_unc_ukf3 / vel_unc_ekf3) * 100
+ax_cov2[1, 0].set_title(
+    f"Combined Velocity Uncertainty\n(UKF avg improvement: {np.mean(improvement_vel[50:]):.1f}%)",
+    fontsize=12,
+    fontweight="bold",
+)
+ax_cov2[1, 0].set_ylabel("σ_vel (m/s)")
+ax_cov2[1, 0].set_xlabel("Time (s)")
+ax_cov2[1, 0].legend(fontsize=11)
+ax_cov2[1, 0].grid(True, alpha=0.3)
+
+# Relative improvement (%)
+rel_improvement_vel = (vel_unc_ekf3 - vel_unc_ukf3) / vel_unc_ekf3 * 100
+ax_cov2[1, 1].plot(t3, rel_improvement_vel, "purple", linewidth=2.5)
+ax_cov2[1, 1].axhline(y=0, color="k", linestyle="--", alpha=0.5)
+ax_cov2[1, 1].fill_between(t3, 0, rel_improvement_vel, alpha=0.3, color="purple")
+ax_cov2[1, 1].set_title(
+    "UKF Relative Improvement over EKF", fontsize=12, fontweight="bold"
+)
+ax_cov2[1, 1].set_ylabel("Improvement (%)")
+ax_cov2[1, 1].set_xlabel("Time (s)")
+ax_cov2[1, 1].grid(True, alpha=0.3)
+
+fig_cov2.suptitle(
+    "Scenario 3: Velocity Uncertainty Comparison (EKF vs UKF)",
+    fontsize=14,
+    fontweight="bold",
+)
+fig_cov2.tight_layout()
+plt.show()
+
+# === Figure 3: Position Error with 2σ Confidence Bounds ===
+fig_cov3, ax_cov3 = plt.subplots(2, 1, figsize=(15, 10))
+
+# EKF position error with bounds
+err_x_ekf = true_state3[0, :] - x_est_ekf3[:, 0]
+err_y_ekf = true_state3[1, :] - x_est_ekf3[:, 1]
+err_x_ukf = true_state3[0, :] - x_est_ukf3[:, 0]
+err_y_ukf = true_state3[1, :] - x_est_ukf3[:, 1]
+
+ax_cov3[0].plot(t3, err_x_ekf, "r-", linewidth=2, label="EKF X Error", alpha=0.8)
+ax_cov3[0].fill_between(
+    t3, -2 * std_ekf3_x, 2 * std_ekf3_x, alpha=0.25, color="red", label="EKF 2σ bounds"
+)
+ax_cov3[0].plot(t3, err_x_ukf, "g-", linewidth=2, label="UKF X Error", alpha=0.8)
+ax_cov3[0].fill_between(
+    t3,
+    -2 * std_ukf3_x,
+    2 * std_ukf3_x,
+    alpha=0.25,
+    color="green",
+    label="UKF 2σ bounds",
+)
+ax_cov3[0].axhline(y=0, color="k", linestyle="--", alpha=0.5)
+ax_cov3[0].set_title(
+    "Position X Error with 2σ Confidence Bounds", fontsize=12, fontweight="bold"
+)
+ax_cov3[0].set_ylabel("Error (m)")
+ax_cov3[0].legend(fontsize=11, loc="upper left")
+ax_cov3[0].grid(True, alpha=0.3)
+
+# Y position error with bounds
+ax_cov3[1].plot(t3, err_y_ekf, "r-", linewidth=2, label="EKF Y Error", alpha=0.8)
+ax_cov3[1].fill_between(
+    t3, -2 * std_ekf3_y, 2 * std_ekf3_y, alpha=0.25, color="red", label="EKF 2σ bounds"
+)
+ax_cov3[1].plot(t3, err_y_ukf, "g-", linewidth=2, label="UKF Y Error", alpha=0.8)
+ax_cov3[1].fill_between(
+    t3,
+    -2 * std_ukf3_y,
+    2 * std_ukf3_y,
+    alpha=0.25,
+    color="green",
+    label="UKF 2σ bounds",
+)
+ax_cov3[1].axhline(y=0, color="k", linestyle="--", alpha=0.5)
+ax_cov3[1].set_title(
+    "Position Y Error with 2σ Confidence Bounds", fontsize=12, fontweight="bold"
+)
+ax_cov3[1].set_ylabel("Error (m)")
+ax_cov3[1].set_xlabel("Time (s)")
+ax_cov3[1].legend(fontsize=11, loc="upper left")
+ax_cov3[1].grid(True, alpha=0.3)
+
+fig_cov3.suptitle(
+    "Scenario 3: Position Estimation Error with Uncertainty Bounds",
+    fontsize=14,
+    fontweight="bold",
+)
+fig_cov3.tight_layout()
+plt.show()
+
+# === Summary Statistics ===
+print("\n" + "=" * 70)
+print("COVARIANCE COMPARISON SUMMARY (Scenario 3)")
+print("=" * 70)
+print(f"\nPosition Uncertainty (after transient ~50 steps):")
+print(f"  EKF mean σ_pos: {np.mean(pos_unc_ekf3[50:]):.3f} m")
+print(f"  UKF mean σ_pos: {np.mean(pos_unc_ukf3[50:]):.3f} m")
+print(f"  UKF improvement: {np.mean(improvement_pos[50:]):.2f}%")
+
+print(f"\nVelocity Uncertainty (after transient ~50 steps):")
+print(f"  EKF mean σ_vel: {np.mean(vel_unc_ekf3[50:]):.3f} m/s")
+print(f"  UKF mean σ_vel: {np.mean(vel_unc_ukf3[50:]):.3f} m/s")
+print(f"  UKF improvement: {np.mean(improvement_vel[50:]):.2f}%")
+
+print(f"\nTotal Covariance Trace:")
+print(f"  EKF mean tr(P): {np.mean(trace_ekf3[50:]):.3f}")
+print(f"  UKF mean tr(P): {np.mean(trace_ukf3[50:]):.3f}")
+
+# Compute how often errors fall within 2-sigma bounds (consistency check)
+ekf_x_consistent = (
+    np.sum(np.abs(err_x_ekf[50:]) <= 2 * std_ekf3_x[50:]) / len(err_x_ekf[50:]) * 100
+)
+ukf_x_consistent = (
+    np.sum(np.abs(err_x_ukf[50:]) <= 2 * std_ukf3_x[50:]) / len(err_x_ukf[50:]) * 100
+)
+ekf_y_consistent = (
+    np.sum(np.abs(err_y_ekf[50:]) <= 2 * std_ekf3_y[50:]) / len(err_y_ekf[50:]) * 100
+)
+ukf_y_consistent = (
+    np.sum(np.abs(err_y_ukf[50:]) <= 2 * std_ukf3_y[50:]) / len(err_y_ukf[50:]) * 100
+)
+
+print(f"\nErrors within 2σ bounds (consistency check, target ≈ 95%):")
+print(f"  EKF X: {ekf_x_consistent:.1f}%")
+print(f"  EKF Y: {ekf_y_consistent:.1f}%")
+print(f"  UKF X: {ukf_x_consistent:.1f}%")
+print(f"  UKF Y: {ukf_y_consistent:.1f}%")
+print("=" * 70)
 ax3_sol[1, 1].plot(t3, trace_ukf3, "g-", label="UKF tr(P)", linewidth=2)
 ax3_sol[1, 1].set_title("Covariance Trace (Total Uncertainty)")
 ax3_sol[1, 1].set_xlabel("Time (s)")
